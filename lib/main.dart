@@ -3,11 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image/image.dart' as img;
+import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -127,12 +128,28 @@ class PrintModel extends ChangeNotifier {
 
   Future<void> addHistory(PrintJob j, String printer) async {
     history.insert(0, HistoryEntry(j.name, j.path, DateTime.now(), printer));
-    if (history.length > 50) history = history.sublist(0, 50);
+    if (history.length > 50) {
+      for (final old in history.sublist(50)) {
+        _deleteFile(old.path);
+      }
+      history = history.sublist(0, 50);
+    }
     notifyListeners();
     await _saveHistory();
   }
 
+  void _deleteFile(String? p) {
+    if (p == null) return;
+    try {
+      final f = File(p);
+      if (f.existsSync()) f.deleteSync();
+    } catch (_) {}
+  }
+
   Future<void> clearHistory() async {
+    for (final e in history) {
+      _deleteFile(e.path);
+    }
     history = [];
     notifyListeners();
     await _saveHistory();
@@ -217,18 +234,35 @@ Future<T> withLoading<T>(BuildContext context, Future<T> Function() task) async 
 void snack(BuildContext context, String msg) =>
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
+const _docGroup = XTypeGroup(
+  label: 'مستندات',
+  extensions: ['pdf', 'jpg', 'jpeg', 'png'],
+  mimeTypes: ['application/pdf', 'image/jpeg', 'image/png'],
+  uniformTypeIdentifiers: ['com.adobe.pdf', 'public.jpeg', 'public.png'],
+);
+
+const _imageGroup = XTypeGroup(
+  label: 'صور',
+  extensions: ['jpg', 'jpeg', 'png'],
+  mimeTypes: ['image/jpeg', 'image/png'],
+  uniformTypeIdentifiers: ['public.jpeg', 'public.png'],
+);
+
+/// ينسخ الملف إلى مجلد التطبيق ليبقى متاحاً لإعادة الطباعة من السجل.
+Future<String> _store(String name, Uint8List bytes) async {
+  final dir = Directory('${(await getApplicationSupportDirectory()).path}/files');
+  await dir.create(recursive: true);
+  final f = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
+  await f.writeAsBytes(bytes, flush: true);
+  return f.path;
+}
+
 Future<void> pickAndOpen(BuildContext context, {bool images = false}) async {
-  final res = await FilePicker.platform.pickFiles(
-    type: images ? FileType.image : FileType.custom,
-    allowedExtensions: images ? null : ['pdf', 'jpg', 'jpeg', 'png'],
-    withData: true,
-  );
-  final f = res?.files.single;
+  final f = await openFile(acceptedTypeGroups: [images ? _imageGroup : _docGroup]);
   if (f == null) return;
-  final bytes = f.bytes ?? (f.path != null ? await File(f.path!).readAsBytes() : null);
-  if (bytes == null) return;
+  final bytes = await f.readAsBytes();
   if (!context.mounted) return;
-  await openJob(context, f.name, bytes, f.path);
+  await openJob(context, f.name, bytes, null);
 }
 
 Future<void> reopen(BuildContext context, HistoryEntry e) async {
@@ -249,7 +283,8 @@ Future<void> openJob(BuildContext context, String name, Uint8List bytes, String?
     snack(context, 'نوع الملف غير مدعوم. استخدم PDF أو صورة JPG/PNG (صدّر مستند Word إلى PDF أولاً).');
     return;
   }
-  final job = PrintJob(name, bytes, isPdf, path);
+  final stored = path ?? await _store(name, bytes);
+  final job = PrintJob(name, bytes, isPdf, stored);
   await withLoading(context, job.prepare);
   model.update(() => model.job = job);
   if (!context.mounted) return;
@@ -496,7 +531,7 @@ class HomeTab extends StatelessWidget {
       listenable: model,
       builder: (context, _) {
         final seen = <String>{};
-        final recent = model.history.where((e) => seen.add(e.path ?? e.name)).take(3).toList();
+        final recent = model.history.where((e) => seen.add(e.name)).take(3).toList();
         return ListView(
           padding: const EdgeInsets.all(20),
           children: [
