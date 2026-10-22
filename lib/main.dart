@@ -214,7 +214,7 @@ class _SplashScreenState extends State<SplashScreen> {
                 decoration: BoxDecoration(
                   color: kBlue,
                   borderRadius: BorderRadius.circular(32),
-                  boxShadow: [BoxShadow(color: kBlue.withOpacity(.45), blurRadius: 32, offset: const Offset(0, 12))],
+                  boxShadow: [BoxShadow(color: kBlue.withValues(alpha: .45), blurRadius: 32, offset: const Offset(0, 12))],
                 ),
                 child: const Icon(Icons.print_rounded, size: 56, color: Colors.white),
               ),
