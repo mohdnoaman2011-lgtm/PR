@@ -74,6 +74,8 @@ class PrintModel extends ChangeNotifier {
   bool canList = false;
   List<Printer> printers = [];
   Printer? selected;
+  List<String> ips = [];
+  String? selectedIp;
   List<HistoryEntry> history = [];
   SharedPreferences? _prefs;
 
@@ -92,6 +94,9 @@ class PrintModel extends ChangeNotifier {
       history = (_prefs!.getStringList('history') ?? [])
           .map((s) => HistoryEntry.fromJson(jsonDecode(s)))
           .toList();
+      ips = _prefs!.getStringList('ips') ?? [];
+      selectedIp = _prefs!.getString('selIp');
+      if (selectedIp != null && !ips.contains(selectedIp)) selectedIp = null;
     } catch (_) {}
     notifyListeners();
     await loadPrinters();
@@ -155,7 +160,37 @@ class PrintModel extends ChangeNotifier {
     await _saveHistory();
   }
 
-  String get printerLabel => (canList && selected != null) ? selected!.name : 'نافذة الطباعة في النظام';
+  Future<void> addIp(String ip) async {
+    if (!ips.contains(ip)) ips.add(ip);
+    selectedIp = ip;
+    notifyListeners();
+    await _prefs?.setStringList('ips', ips);
+    await _prefs?.setString('selIp', ip);
+  }
+
+  Future<void> removeIp(String ip) async {
+    ips.remove(ip);
+    if (selectedIp == ip) selectedIp = null;
+    notifyListeners();
+    await _prefs?.setStringList('ips', ips);
+    if (selectedIp == null) await _prefs?.remove('selIp');
+  }
+
+  Future<void> selectIp(String? ip) async {
+    selectedIp = ip;
+    notifyListeners();
+    if (ip == null) {
+      await _prefs?.remove('selIp');
+    } else {
+      await _prefs?.setString('selIp', ip);
+    }
+  }
+
+  String get printerLabel => selectedIp != null
+      ? 'طابعة $selectedIp'
+      : (canList && selected != null)
+          ? selected!.name
+          : 'نافذة الطباعة في النظام';
 }
 
 final model = PrintModel();
@@ -198,9 +233,101 @@ Future<Uint8List> buildPdf(PrintJob job, PdfPageFormat fmt) async {
   return doc.save();
 }
 
+bool isValidHost(String s) => RegExp(r'^[A-Za-z0-9][A-Za-z0-9.\-]*(:\d{1,5})?$').hasMatch(s);
+
+(String, int?) parseHost(String s) {
+  final i = s.lastIndexOf(':');
+  if (i < 0) return (s, null);
+  return (s.substring(0, i), int.tryParse(s.substring(i + 1)));
+}
+
+/// يتحقق هل الطابعة تستقبل اتصالات (IPP على 631 أو الطباعة المباشرة على 9100).
+Future<bool> probe(String target) async {
+  final (host, port) = parseHost(target);
+  for (final p in [port ?? 631, 9100]) {
+    try {
+      final s = await Socket.connect(host, p, timeout: const Duration(seconds: 3));
+      s.destroy();
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+Uint8List _ippAttr(int tag, String name, String value) {
+  final n = utf8.encode(name), v = utf8.encode(value);
+  final b = BytesBuilder()
+    ..addByte(tag)
+    ..add([n.length >> 8, n.length & 255])
+    ..add(n)
+    ..add([v.length >> 8, v.length & 255])
+    ..add(v);
+  return b.toBytes();
+}
+
+/// يرسل ملف PDF بصيغة IPP Print-Job. يعيد null عند النجاح أو رسالة الخطأ.
+Future<String?> _ippPost(String host, int port, String path, Uint8List pdf, String jobName) async {
+  final b = BytesBuilder()
+    ..add([1, 1, 0, 2, 0, 0, 0, 1, 1]) // IPP 1.1 · Print-Job · request-id 1 · operation-attributes
+    ..add(_ippAttr(0x47, 'attributes-charset', 'utf-8'))
+    ..add(_ippAttr(0x48, 'attributes-natural-language', 'en'))
+    ..add(_ippAttr(0x45, 'printer-uri', 'ipp://$host:$port$path'))
+    ..add(_ippAttr(0x42, 'requesting-user-name', 'print-app'))
+    ..add(_ippAttr(0x42, 'job-name', jobName))
+    ..add(_ippAttr(0x49, 'document-format', 'application/pdf'))
+    ..addByte(3)
+    ..add(pdf);
+  final body = b.toBytes();
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+  try {
+    final req = await client.postUrl(Uri.parse('http://$host:$port$path'));
+    req.headers.contentType = ContentType('application', 'ipp');
+    req.contentLength = body.length;
+    req.add(body);
+    final res = await req.close().timeout(const Duration(seconds: 30));
+    final data = await res.fold<BytesBuilder>(BytesBuilder(), (a, d) => a..add(d));
+    final bytes = data.toBytes();
+    if (res.statusCode != 200 || bytes.length < 4) return 'HTTP ${res.statusCode}';
+    final status = (bytes[2] << 8) | bytes[3];
+    return status < 0x0100 ? null : 'IPP 0x${status.toRadixString(16)}';
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// يطبع مباشرة على طابعة بعنوان IP: أولاً عبر IPP ثم الطباعة المباشرة على المنفذ 9100.
+Future<void> printToIp(String target, Uint8List pdf, String jobName) async {
+  final (host, port) = parseHost(target);
+  String? ippError;
+  for (final path in const ['/ipp/print', '/ipp', '/']) {
+    try {
+      final err = await _ippPost(host, port ?? 631, path, pdf, jobName);
+      if (err == null) return;
+      ippError = err;
+    } catch (e) {
+      ippError = '$e';
+      break;
+    }
+  }
+  try {
+    final s = await Socket.connect(host, 9100, timeout: const Duration(seconds: 5));
+    s.add(pdf);
+    await s.flush();
+    await s.close();
+    return;
+  } catch (_) {}
+  throw Exception('تعذّر الإرسال إلى $target (${ippError ?? 'لا اتصال'}).\nتأكد أن الطابعة تعمل وعلى نفس شبكة الهاتف وتدعم الطباعة عبر الشبكة.');
+}
+
 /// يفتح نافذة الطباعة (أو يطبع مباشرة على الطابعة المحددة في أنظمة سطح المكتب).
 Future<bool> doPrint() async {
   final job = model.job!;
+  final ip = model.selectedIp;
+  if (ip != null) {
+    final bytes = await buildPdf(job, model.format);
+    await printToIp(ip, bytes, job.name);
+    return true;
+  }
   if (model.canList && model.selected != null) {
     return Printing.directPrintPdf(
       printer: model.selected!,
@@ -560,7 +687,7 @@ class HomeTab extends StatelessWidget {
                     Expanded(
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         Text(model.printerLabel, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 16)),
-                        const Text('اختر الطابعة عند الطباعة', style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 13)),
+                        Text(model.selectedIp != null ? 'طباعة مباشرة عبر الشبكة' : 'اختر الطابعة عند الطباعة', style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 13)),
                       ]),
                     ),
                     const CircleAvatar(radius: 5, backgroundColor: Color(0xFF22C55E)),
@@ -620,52 +747,115 @@ class HomeTab extends StatelessWidget {
 class PrintersTab extends StatelessWidget {
   const PrintersTab({super.key});
 
+  Future<void> _addIp(BuildContext context) async {
+    final c = TextEditingController();
+    String? err;
+    final ip = await showDialog<String>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          title: const Text('إضافة طابعة بعنوان IP'),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            TextField(
+              controller: c,
+              autofocus: true,
+              keyboardType: TextInputType.url,
+              textDirection: TextDirection.ltr,
+              decoration: InputDecoration(labelText: 'عنوان IP', hintText: '192.168.1.50', errorText: err),
+            ),
+            const SizedBox(height: 8),
+            const Text('يجب أن يكون الهاتف والطابعة على نفس الشبكة. يمكنك كتابة المنفذ أيضاً، مثل 192.168.1.50:631', style: TextStyle(fontSize: 12)),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+            FilledButton(
+              onPressed: () {
+                final v = c.text.trim();
+                if (!isValidHost(v)) {
+                  setS(() => err = 'عنوان غير صحيح');
+                  return;
+                }
+                Navigator.pop(ctx, v);
+              },
+              child: const Text('إضافة'),
+            ),
+          ],
+        ),
+      ),
+    );
+    c.dispose();
+    if (ip == null) return;
+    await model.addIp(ip);
+    final ok = await probe(ip);
+    if (context.mounted) snack(context, ok ? 'تم الاتصال بالطابعة' : 'تمت الإضافة، لكن تعذر الوصول إلى الطابعة حالياً');
+  }
+
+  Widget _check(bool on) => on
+      ? const CircleAvatar(radius: 13, backgroundColor: kBlue, child: Icon(Icons.check, size: 16, color: Colors.white))
+      : const Icon(Icons.circle_outlined, color: Color(0xFFCBD5E1));
+
   @override
   Widget build(BuildContext context) {
     final muted = Theme.of(context).colorScheme.onSurfaceVariant;
     return ListenableBuilder(
       listenable: model,
-      builder: (context, _) => ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          Heading('الطابعات', model.canList ? 'تم العثور على ${ar(model.printers.length)} طابعات' : 'الطباعة عبر نظام الهاتف'),
-          const SizedBox(height: 16),
-          if (!model.canList)
+      builder: (context, _) {
+        final systemSelected = model.selectedIp == null && !(model.canList && model.selected != null);
+        return ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            const Heading('الطابعات', 'اختر طريقة الطباعة'),
+            const SizedBox(height: 16),
             AppCard(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Row(children: [IconTile(Icons.print), SizedBox(width: 12), Expanded(child: Text('اختيار الطابعة يتم عند الطباعة', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)))]),
-                const SizedBox(height: 10),
-                Text(
-                  'على الهاتف تظهر نافذة الطباعة الخاصة بالنظام عند الضغط على «طباعة»، وتعرض كل الطابعات المتاحة (Wi‑Fi، بلوتوث، USB، Mopria/AirPrint) ويمكنك الاختيار منها هناك.\n\n'
-                  'لإضافة طابعة جديدة: فعّل خدمة الطباعة المناسبة من إعدادات الهاتف (الاتصال ← الطباعة) أو من متجر التطبيقات.',
-                  style: TextStyle(color: muted, height: 1.6),
-                ),
-              ]),
-            ),
-          for (final p in model.printers) ...[
-            AppCard(
-              selected: model.selected?.url == p.url,
-              onTap: () => model.update(() => model.selected = p),
-              child: Item(
-                const IconTile(Icons.print),
-                p.name,
-                p.model ?? p.location ?? p.url,
-                trailing: model.selected?.url == p.url
-                    ? const CircleAvatar(radius: 13, backgroundColor: kBlue, child: Icon(Icons.check, size: 16, color: Colors.white))
-                    : const Icon(Icons.circle_outlined, color: Color(0xFFCBD5E1)),
-              ),
+              selected: systemSelected,
+              onTap: () => model.update(() {
+                model.selected = null;
+                model.selectIp(null);
+              }),
+              child: Item(const IconTile(Icons.phone_android), 'نافذة الطباعة في النظام', 'Wi‑Fi · بلوتوث · USB · Mopria / AirPrint', trailing: _check(systemSelected)),
             ),
             const SizedBox(height: 12),
-          ],
-          if (model.canList)
+            for (final ip in model.ips) ...[
+              AppCard(
+                selected: model.selectedIp == ip,
+                onTap: () => model.selectIp(ip),
+                child: Item(
+                  const IconTile(Icons.lan),
+                  ip,
+                  'طابعة شبكة · طباعة مباشرة',
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    IconButton(tooltip: 'حذف', onPressed: () => model.removeIp(ip), icon: const Icon(Icons.delete_outline)),
+                    _check(model.selectedIp == ip),
+                  ]),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            for (final p in model.printers) ...[
+              AppCard(
+                selected: model.selectedIp == null && model.selected?.url == p.url,
+                onTap: () {
+                  model.selectIp(null);
+                  model.update(() => model.selected = p);
+                },
+                child: Item(const IconTile(Icons.print), p.name, p.model ?? p.location ?? p.url, trailing: _check(model.selectedIp == null && model.selected?.url == p.url)),
+              ),
+              const SizedBox(height: 12),
+            ],
             OutlinedButton.icon(
-              onPressed: model.loadPrinters,
-              icon: const Icon(Icons.refresh),
-              label: const Text('تحديث القائمة'),
+              onPressed: () => _addIp(context),
+              icon: const Icon(Icons.add),
+              label: const Text('إضافة طابعة بعنوان IP'),
               style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(54), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
             ),
-        ],
-      ),
+            const SizedBox(height: 12),
+            Text(
+              'نافذة النظام تعرض كل الطابعات المتاحة على هاتفك. أما الطباعة بعنوان IP فترسل الملف مباشرة إلى الطابعة عبر الشبكة المحلية (IPP أو المنفذ 9100)، ويجب أن تدعم الطابعة طباعة ملفات PDF.',
+              style: TextStyle(color: muted, fontSize: 12, height: 1.6),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -927,7 +1117,7 @@ class _PrintProgressScreenState extends State<PrintProgressScreen> {
   Widget build(BuildContext context) {
     final muted = Theme.of(context).colorScheme.onSurfaceVariant;
     final (IconData?, Color, String, String) v = switch (_phase) {
-      _Phase.busy => (null, kBlue, 'جارٍ تجهيز الطباعة…', 'ستظهر نافذة اختيار الطابعة بعد لحظات'),
+      _Phase.busy => (null, kBlue, 'جارٍ تجهيز الطباعة…', (model.selectedIp != null ? 'جارٍ إرسال الملف إلى الطابعة' : 'ستظهر نافذة اختيار الطابعة بعد لحظات')),
       _Phase.done => (Icons.check_circle, const Color(0xFF15803D), 'تم إرسال المستند للطباعة', model.job!.name),
       _Phase.cancelled => (Icons.cancel_outlined, const Color(0xFFB45309), 'تم إلغاء الطباعة', 'لم يُرسل أي شيء إلى الطابعة'),
       _Phase.error => (Icons.error_outline, const Color(0xFFB91C1C), 'تعذّرت الطباعة', _error),
