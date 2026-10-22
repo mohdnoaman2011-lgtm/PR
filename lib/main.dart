@@ -6,7 +6,6 @@ import 'dart:typed_data';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -86,22 +85,23 @@ class PrintModel extends ChangeNotifier {
   }
 
   Future<void> init() async {
-    _prefs = await SharedPreferences.getInstance();
-    paper = _prefs!.getString('paper') ?? 'A4';
-    themeMode.value = (_prefs!.getBool('dark') ?? false) ? ThemeMode.dark : ThemeMode.light;
     try {
+      _prefs = await SharedPreferences.getInstance().timeout(const Duration(seconds: 5));
+      paper = _prefs!.getString('paper') ?? 'A4';
+      themeMode.value = (_prefs!.getBool('dark') ?? false) ? ThemeMode.dark : ThemeMode.light;
       history = (_prefs!.getStringList('history') ?? [])
           .map((s) => HistoryEntry.fromJson(jsonDecode(s)))
           .toList();
     } catch (_) {}
+    notifyListeners();
     await loadPrinters();
   }
 
   Future<void> loadPrinters() async {
     try {
-      final info = await Printing.info();
+      final info = await Printing.info().timeout(const Duration(seconds: 3));
       canList = info.canListPrinters;
-      printers = canList ? await Printing.listPrinters() : [];
+      printers = canList ? await Printing.listPrinters().timeout(const Duration(seconds: 5)) : [];
       if (selected != null && !printers.any((p) => p.url == selected!.url)) selected = null;
       selected ??= printers.isEmpty
           ? null
@@ -295,8 +295,20 @@ Future<void> openJob(BuildContext context, String name, Uint8List bytes, String?
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await model.init();
+  // يعرض نص الخطأ بدل شاشة فارغة إن حدث استثناء أثناء بناء الواجهة.
+  ErrorWidget.builder = (details) => Material(
+        color: Colors.white,
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text('حدث خطأ:\n${details.exceptionAsString()}',
+                textDirection: TextDirection.rtl, style: const TextStyle(color: Colors.red, fontSize: 14)),
+          ),
+        ),
+      );
+  // نشغّل الواجهة فوراً، والتحميل (الإعدادات والطابعات) يتم في الخلفية.
   runApp(const PrintApp());
+  unawaited(model.init());
 }
 
 class PrintApp extends StatelessWidget {
@@ -310,7 +322,6 @@ class PrintApp extends StatelessWidget {
     );
     return base.copyWith(
       scaffoldBackgroundColor: b == Brightness.light ? const Color(0xFFF4F6FB) : null,
-      textTheme: GoogleFonts.cairoTextTheme(base.textTheme),
       cardTheme: CardThemeData(
         elevation: 1,
         margin: EdgeInsets.zero,
